@@ -61,6 +61,33 @@ local function pick_dir(title, path)
   return id
 end
 
+-- ask for a session name; returns nil if dismissed, "" to let the server pick
+local function ask_session_name(default)
+  local text, why, detail = rex.ui.input{
+    title = "What will you work on?",
+    placeholder = "Leave empty for a random name",
+    value = default or "",
+    confirm = "Create session",
+  }
+  if text == nil then
+    if why ~= "cancelled" and why ~= "timeout" then
+      error("input " .. why .. (detail and (": " .. detail) or ""))
+    end
+    return nil
+  end
+  return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- create a session holding one window with layout, and show it
+local function open_session(label, layout)
+  local args = { initial_windows = { { layout = layout } } }
+  if label ~= "" then args.label = label end
+  local res, err = rex.call("session.create", args)
+  if not res then error("couldn't create session: " .. tostring(err)) end
+  rex.client.queue("session.select", { session_id = res.session_id })
+  return res
+end
+
 -- rex do new_space project=bobrwm
 -- rex do new_space project=akita sub=akitavault
 -- missing args are asked for with a picker
@@ -77,6 +104,9 @@ rex.action{
       local sub = args.sub or pick_dir("Akita folder", dir)
       if not sub then return end
       dir = dir .. "/" .. sub
+    elseif project == "sxitch_dev" then
+      local sub = "sxitch"
+      dir = dir .. "/" .. sub
     end
     if not is_dir(dir) then error("no such directory: " .. dir) end
 
@@ -87,11 +117,24 @@ rex.action{
         shell{ cwd = dir }                                 -- bottom right
       )
     )
-    local w, err = rex.session.new_window{ layout = layout }
-    if not w then error(err) end
-    return w
+    local name = ask_session_name(dir:match("[^/]+$"))
+    if not name then return end
+    return open_session(name, layout)
   end,
 }
+
+-- replaces the app's New Session so every new session gets named
+rex.action{
+  name  = "new_session",
+  title = "New named session…",
+  run = function(ctx)
+    local name = ask_session_name()
+    if not name then return end
+    return open_session(name, shell{ cwd = os.getenv("HOME") })
+  end,
+}
+
+rex.bind("cmd+shift+n", "new_session")
 
 rex.bind("ctrl+opt+m", "new_space")  -- optional key binding
 
@@ -323,3 +366,80 @@ rex.action {
 }
 
 rex.bind("cmd+shift+k", "open_site")
+
+-- sessions -------------------------------------------------------------------
+-- cmd+shift+o picks a session by name, or by what its active tab is showing
+
+local terminal = "com.superlogical.terminal"
+local home_pat = "^" .. os.getenv("HOME"):gsub("%p", "%%%0")
+
+-- Actions share the app's connection, so attaching to or detaching from a
+-- session here would change what the app is attached to (and detaching breaks
+-- its terminals). Other sessions are read through the CLI's own connection.
+local function cli_json(argv)
+  local res = rex.exec.start(argv):wait()
+  if not res.ok or res.stdout == "" then return nil end
+  local ok, v = pcall(rex.json.decode, res.stdout)
+  return ok and v or nil
+end
+
+local function session_view(sid, mine)
+  if mine then return rex.call("session.view", { session_id = sid }) end
+  return cli_json{ rex_bin, "api", "call", "-s", sid, "session.view", "{}" }
+end
+
+-- title and directory of a block's terminal, either may be nil
+local function block_info(sid, bid, mine)
+  if not bid then return end
+  local t, p
+  if mine then
+    local args = { session_id = sid, block_id = bid }
+    t = rex.block.call(terminal, "title", args)
+    p = rex.block.call(terminal, "pwd", args)
+  else
+    t = cli_json{ rex_bin, "block", "call", "-s", sid, "-b", bid, "title" }
+    p = cli_json{ rex_bin, "block", "call", "-s", sid, "-b", bid, "pwd" }
+  end
+  local dir = p and p.pwd and url_decode(p.pwd:gsub("^file://[^/]*", "")) or nil
+  return t and t.title ~= "" and t.title or nil, dir and dir:gsub(home_pat, "~")
+end
+
+rex.action{
+  name  = "session_picker",
+  title = "Go to session…",
+  run = function(ctx)
+    local list, err = rex.call("session.list")
+    if not list then error("couldn't list sessions: " .. tostring(err)) end
+
+    local items = {}
+    for _, s in ipairs(list.sessions or {}) do
+      local mine = s.session_id == ctx.session_id
+      local view = session_view(s.session_id, mine)
+      local sub = {}
+      if mine then sub[#sub + 1] = "current" end
+      if view then
+        local tabs = #(view.windows or {})
+        sub[#sub + 1] = tabs == 1 and "1 tab" or (tabs .. " tabs")
+        for _, w in ipairs(view.windows or {}) do
+          if w.window_id == view.active_window_id then
+            local title, dir = block_info(s.session_id, w.focused_block_id, mine)
+            if dir then sub[#sub + 1] = dir end
+            if title then sub[#sub + 1] = title end
+          end
+        end
+      end
+      items[#items + 1] = {
+        id = s.session_id,
+        title = s.label or s.session_id,
+        subtitle = table.concat(sub, " · "),
+      }
+    end
+    if #items == 0 then error("no sessions") end
+
+    local id = pick("Sessions", "Filter sessions", items)
+    if not id or id == ctx.session_id then return end
+    rex.client.queue("session.select", { session_id = id })
+  end,
+}
+
+rex.bind("cmd+shift+o", "session_picker")
